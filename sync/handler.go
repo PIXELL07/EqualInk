@@ -35,9 +35,9 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/pixell07/equalink/config"
+	"github.com/pixell07/equalink/document"
 	"github.com/redis/go-redis/v9"
-	"github.com/yourusername/equalink/config"
-	"github.com/yourusername/equalink/document"
 	"gorm.io/gorm"
 )
 
