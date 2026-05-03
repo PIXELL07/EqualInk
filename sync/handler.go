@@ -2,301 +2,146 @@ package sync
 
 /*
 
- auth/handler.go — OTP Authentication (Email + Phone)
+  The Brain of EqualInk
 
-  HOW IT WORKS:
-  1. Client POSTs /auth/send-otp  { identifier }
-     → We detect email vs phone
-     → Generate a 6-digit code, store in Redis (5 min)
-     → Fire a goroutine to send it via SMTP/SMS
-     → Return { session_token } (unsigned, for tracking)
+  EVERY Yjs diff from EVERY user lands here.
+  Three things happen in order:
 
-  2. Client POSTs /auth/verify-otp { session, code }
-     → Load OTP from Redis, compare
-     → On match: create/find User in DB
-     → Sign a JWT (24h), delete OTP from Redis
-     → Return { jwt, user }
+  1. PERSIST  → AppendUpdate (goroutine, non-blocking)
+     WHY goroutine: DB writes take 1-5ms. We can't
+     block the WebSocket receive loop for that long.
+     If the server crashes before the write, the diff
+     is lost — acceptable tradeoff for low latency.
+     For higher durability: use a buffered channel +
+     a dedicated writer goroutine (see store.go).
 
-  WHY REDIS for OTP storage?
-  OTPs are ephemeral (5 min TTL). Storing in Postgres
-  wastes a row write + forces a DELETE on verify.
-  Redis SET with EX = automatic expiry, zero cleanup.
+  2. BROADCAST → Hub.Broadcast channel
+     Sends diff to all other users on this document.
+     Non-blocking because the Hub's Broadcast channel
+     is buffered (256). If the buffer fills up, we drop
+     the message (eventual consistency via Yjs re-sync).
+
+  3. TRACK → analytics.Tracker.Record
+     Just updates in-memory counters. O(1), lock-free
+     fast path. Actual DB write happens in flusher.
 
 */
 
 import (
-	"context"
-	"crypto/rand"
 	"encoding/json"
-	"fmt"
-	"math/big"
 	"net/http"
-	"strings"
-	"time"
 
-	"github.com/golang-jwt/jwt/v5"
-	"github.com/pixell07/equalink/config"
+	"github.com/pixell07/equalink/analytics"
+	"github.com/pixell07/equalink/auth"
 	"github.com/pixell07/equalink/document"
-	"github.com/redis/go-redis/v9"
-	"gorm.io/gorm"
+	"github.com/pixell07/equalink/hub"
 )
 
 type Handler struct {
-	db    *gorm.DB
-	redis *redis.Client
-	cfg   *config.Config
+	Store   *document.Store
+	Tracker *analytics.Tracker
+	Hub     *hub.Hub
 }
 
-func NewHandler(db *gorm.DB, rdb *redis.Client, cfg *config.Config) *Handler {
-	return &Handler{db: db, redis: rdb, cfg: cfg}
+// HandleUpdate is called by ws/read_pump.go for every incoming binary frame.
+// It's the central dispatch — keep it thin, delegate to specialists.
+func (h *Handler) HandleUpdate(userID, docID string, payload []byte) {
+	// 1. PERSIST — fire and forget (goroutine)
+	go h.Store.AppendUpdate(docID, userID, payload)
+
+	// 2. BROADCAST — non-blocking channel send
+	select {
+	case h.Hub.Broadcast <- hub.Message{
+		SenderID: userID,
+		DocID:    docID,
+		Payload:  payload,
+	}:
+	default:
+		// Broadcast buffer full — drop. Yjs will re-sync via state vector exchange.
+	}
+
+	// 3. TRACK — O(1) in-memory increment
+	h.Tracker.Record(userID, docID, len(payload))
 }
 
-// Request / Response types
-
-type SendOTPRequest struct {
-	Identifier string `json:"identifier"` // email or E.164 phone
-}
-
-type SendOTPResponse struct {
-	SessionToken string `json:"session_token"` // opaque, used in verify step
-	Method       string `json:"method"`        // "email" or "sms"
-}
-
-type VerifyOTPRequest struct {
-	SessionToken string `json:"session_token"`
-	Code         string `json:"code"`
-	Name         string `json:"name,omitempty"` // only on first signup
-}
-
-type VerifyOTPResponse struct {
-	JWT  string        `json:"jwt"`
-	User document.User `json:"user"`
-}
-
-// SendOTP — POST /auth/send-otp
+// OnJoin sends the current document state to a newly connected client.
+// Called once when the WebSocket connection is established.
 //
-// LOGIC: detect channel → generate code → Redis store → send async
-func (h *Handler) SendOTP(w http.ResponseWriter, r *http.Request) {
-	var req SendOTPRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		httpError(w, "invalid body", 400)
-		return
-	}
-	req.Identifier = strings.TrimSpace(strings.ToLower(req.Identifier))
-	if req.Identifier == "" {
-		httpError(w, "identifier required", 400)
-		return
-	}
-
-	// Detect email vs phone
-	// WHY: same endpoint handles both, channel dictates delivery
-	method := "email"
-	if strings.HasPrefix(req.Identifier, "+") {
-		method = "sms"
-	}
-
-	// Generate 6-digit OTP using crypto/rand (NOT math/rand — security matters)
-	// WHY crypto/rand: math/rand is predictable if seeded with time
-	code, err := generateOTP(6)
+// CRDT SYNC PROTOCOL:
+// Client sends its Yjs "state vector" (a compact summary of what it has).
+// Server diffs the stored blob against that state vector and sends only
+// the missing updates. This is how offline clients catch up efficiently.
+func (h *Handler) OnJoin(userID, docID string, clientStateVector []byte) ([]byte, error) {
+	blob, err := h.Store.LoadBlob(docID)
 	if err != nil {
-		httpError(w, "could not generate OTP", 500)
-		return
+		return nil, err
 	}
+	// In a full Yjs Go implementation (y-crdt bindings), you'd call:
+	//   diff = yrs.Diff(blob, clientStateVector)
+	// For now we send the full blob — client-side Yjs deduplicates.
+	return blob, nil
+}
 
-	// Session token = random 32-byte hex (used as Redis key prefix)
-	sessionToken, err := randomHex(16)
+// REST handlers
+
+// GetDocument — GET /api/docs/:id
+// Returns doc metadata + current online users (from Hub)
+func (h *Handler) GetDocument(w http.ResponseWriter, r *http.Request) {
+	userID := r.Context().Value(auth.UserIDKey).(string)
+	docID := r.PathValue("id")
+
+	doc, err := h.Store.LoadDocument(docID, userID)
 	if err != nil {
-		httpError(w, "server error", 500)
+		http.Error(w, `{"error":"not found"}`, 404)
 		return
 	}
 
-	// Store: Redis key = "otp:{session}:{identifier}" → value = code, TTL = 5min
-	// WHY namespaced key: prevents collision if same user opens two tabs
-	ctx := r.Context()
-	redisKey := fmt.Sprintf("otp:%s:%s", sessionToken, req.Identifier)
-	if err := h.redis.Set(ctx, redisKey, code, 5*time.Minute).Err(); err != nil {
-		httpError(w, "redis error", 500)
-		return
-	}
+	online := h.Hub.OnlineUsers(docID)
 
-	// Send OTP asynchronously — don't block the HTTP response
-	// WHY goroutine: SMTP/SMS can take 200-800ms; client doesn't need to wait
-	go func() {
-		if method == "email" {
-			sendEmailOTP(req.Identifier, code, h.cfg)
-		} else {
-			sendSMSOTP(req.Identifier, code, h.cfg)
-		}
-	}()
-
-	writeJSON(w, SendOTPResponse{SessionToken: sessionToken, Method: method})
-}
-
-// VerifyOTP — POST /auth/verify-otp
-//
-// LOGIC: load OTP → compare → upsert user → sign JWT → delete OTP
-func (h *Handler) VerifyOTP(w http.ResponseWriter, r *http.Request) {
-	var req VerifyOTPRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		httpError(w, "invalid body", 400)
-		return
-	}
-
-	// We need the identifier to reconstruct the Redis key.
-	// Client sends it back (it's not secret, the code IS the secret).
-	// For brevity here we expect identifier in a header or the body.
-	identifier := r.Header.Get("X-Identifier")
-	if identifier == "" {
-		httpError(w, "X-Identifier header required", 400)
-		return
-	}
-
-	ctx := r.Context()
-	redisKey := fmt.Sprintf("otp:%s:%s", req.SessionToken, identifier)
-
-	// Load stored code from Redis
-	storedCode, err := h.redis.Get(ctx, redisKey).Result()
-	if err == redis.Nil {
-		// Key expired or never existed
-		httpError(w, "OTP expired or invalid", 401)
-		return
-	}
-	if err != nil {
-		httpError(w, "redis error", 500)
-		return
-	}
-
-	// Constant-time compare to prevent timing attacks
-	// WHY: naive == comparison leaks info about how many chars matched
-	if !secureEqual(req.Code, storedCode) {
-		httpError(w, "incorrect OTP", 401)
-		return
-	}
-
-	// OTP is correct — delete immediately (one-time use)
-	h.redis.Del(ctx, redisKey)
-
-	// Upsert user — find by identifier or create new
-	// WHY FirstOrCreate: handles sign-up and sign-in in one path
-	user := document.User{Email: identifier}
-	if strings.HasPrefix(identifier, "+") {
-		user = document.User{Phone: identifier}
-	}
-	if req.Name != "" {
-		user.Name = req.Name
-	}
-
-	result := h.db.Where(document.User{Email: identifier}).
-		Attrs(document.User{Name: req.Name}).
-		FirstOrCreate(&user)
-	if result.Error != nil {
-		httpError(w, "db error", 500)
-		return
-	}
-
-	// Sign JWT — 24h expiry, signed with HMAC-256
-	// WHY JWT: stateless auth; Go WebSocket handler validates it on upgrade
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"sub":  user.ID,
-		"name": user.Name,
-		"exp":  time.Now().Add(24 * time.Hour).Unix(),
-	})
-	signed, err := token.SignedString([]byte(h.cfg.JWTSecret))
-	if err != nil {
-		httpError(w, "could not sign token", 500)
-		return
-	}
-
-	writeJSON(w, VerifyOTPResponse{JWT: signed, User: user})
-}
-
-// Helpers
-
-func generateOTP(digits int) (string, error) {
-	max := new(big.Int)
-	max.Exp(big.NewInt(10), big.NewInt(int64(digits)), nil)
-	n, err := rand.Int(rand.Reader, max)
-	if err != nil {
-		return "", err
-	}
-	// Zero-pad to ensure fixed length (e.g. 000042 not 42)
-	return fmt.Sprintf("%0*d", digits, n), nil
-}
-
-func randomHex(n int) (string, error) {
-	b := make([]byte, n)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
-	}
-	return fmt.Sprintf("%x", b), nil
-}
-
-// secureEqual avoids short-circuit evaluation
-func secureEqual(a, b string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	var diff byte
-	for i := range a {
-		diff |= a[i] ^ b[i]
-	}
-	return diff == 0
-}
-
-func sendEmailOTP(to, code string, cfg *config.Config) {
-	// Use cfg.SMTPHost, cfg.SMTPUser, cfg.SMTPPass
-	// Integrate net/smtp or a service like Resend / SendGrid
-	fmt.Printf("[EMAIL] Sending OTP %s to %s\n", code, to)
-}
-
-func sendSMSOTP(to, code string, cfg *config.Config) {
-	// Integrate Twilio or Fast2SMS (India)
-	fmt.Printf("[SMS] Sending OTP %s to %s\n", code, to)
-}
-
-func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(v)
-}
-
-func httpError(w http.ResponseWriter, msg string, code int) {
-	http.Error(w, `{"error":"`+msg+`"}`, code)
-}
-
-// ValidateJWT is used by the WebSocket upgrader middleware
-func ValidateJWT(tokenStr, secret string) (string, error) {
-	token, err := jwt.Parse(tokenStr, func(t *jwt.Token) (any, error) {
-		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, fmt.Errorf("unexpected signing method")
-		}
-		return []byte(secret), nil
+	json.NewEncoder(w).Encode(map[string]any{
+		"doc":    doc,
+		"online": online,
 	})
-	if err != nil || !token.Valid {
-		return "", fmt.Errorf("invalid token")
+}
+
+// AssignTask — POST /api/docs/:id/tasks
+// Validates assignee exists BEFORE persisting (the "offline permission" fix)
+func (h *Handler) AssignTask(w http.ResponseWriter, r *http.Request) {
+	creatorID := r.Context().Value(auth.UserIDKey).(string)
+	docID := r.PathValue("id")
+
+	var body struct {
+		Title      string `json:"title"`
+		AssigneeID string `json:"assignee_id"`
 	}
-	claims, _ := token.Claims.(jwt.MapClaims)
-	return claims["sub"].(string), nil
-}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, `{"error":"invalid body"}`, 400)
+		return
+	}
 
-// contextKey for storing userID in request context
-type contextKey string
+	task, err := h.Store.CreateTask(docID, creatorID, body.AssigneeID, body.Title)
+	if err != nil {
+		http.Error(w, `{"error":"db error"}`, 500)
+		return
+	}
 
-const UserIDKey contextKey = "userID"
-
-// JWTMiddleware validates Bearer token and injects userID into context
-func JWTMiddleware(secret string, next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		authHeader := r.Header.Get("Authorization")
-		if !strings.HasPrefix(authHeader, "Bearer ") {
-			httpError(w, "missing token", 401)
-			return
-		}
-		userID, err := ValidateJWT(strings.TrimPrefix(authHeader, "Bearer "), secret)
-		if err != nil {
-			httpError(w, "invalid token", 401)
-			return
-		}
-		ctx := context.WithValue(r.Context(), UserIDKey, userID)
-		next.ServeHTTP(w, r.WithContext(ctx))
+	// Broadcast task assignment as a structured event to all collaborators
+	// WHY: offline users will receive this on reconnect via Yjs sync
+	taskJSON, _ := json.Marshal(map[string]any{
+		"type": "task_assigned",
+		"task": task,
 	})
+
+	select {
+	case h.Hub.Broadcast <- hub.Message{
+		SenderID: creatorID,
+		DocID:    docID,
+		Payload:  taskJSON,
+	}:
+	default:
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(task)
 }
