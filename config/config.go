@@ -2,7 +2,7 @@ package config
 
 /*
 
-  config.go — All Environment Variables
+  — All Environment Variables
 
   WHY a struct instead of os.Getenv everywhere?
   - Fail fast at startup (missing DB URL = crash now,
